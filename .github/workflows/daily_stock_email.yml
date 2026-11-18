@@ -1,38 +1,11 @@
-name: Daily Stock Report
-
-on:
-  schedule:
-    - cron: "0 3 * * *"
-  workflow_dispatch:
-
-jobs:
-  report:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run stock script
-        run: python stock_screener.py
-
-      - name: Email the Excel file
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          secure: true
-          username: ${{ secrets.EMAIL_USER }}
-          password: ${{ secrets.EMAIL_APP_PASSWORD }}
-          subject: Daily Stock Report
-          to: ${{ secrets.EMAIL_TO }}
-          from: Stock Bot <${{ secrets.EMAIL_USER }}>
-          body: Your daily stock ranking is attached.
-          attachments: stock_ranking.xlsx
+{
+"name": "Daily Stock Report",
+"on": {"schedule": [{"cron": "0 3 * * *"}], "workflow_dispatch": {}},
+"jobs": {"report": {"runs-on": "ubuntu-latest", "steps": [
+{"name": "Checkout repo", "uses": "actions/checkout@v4"},
+{"name": "Set up Python", "uses": "actions/setup-python@v5", "with": {"python-version": "3.11"}},
+{"name": "Install dependencies", "run": "pip install -r requirements.txt"},
+{"name": "Run stock script", "run": "python stock_screener.py"},
+{"name": "Email the Excel file", "uses": "dawidd6/action-send-mail@v3", "with": {"server_address": "smtp.gmail.com", "server_port": 465, "secure": true, "username": "${{ secrets.EMAIL_USER }}", "password": "${{ secrets.EMAIL_APP_PASSWORD }}", "subject": "Daily Stock Report", "to": "${{ secrets.EMAIL_TO }}", "from": "Stock Bot <${{ secrets.EMAIL_USER }}>", "body": "Your daily stock ranking is attached.", "attachments": "stock_ranking.xlsx"}}
+]}}
+}
