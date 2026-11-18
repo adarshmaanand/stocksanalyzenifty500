@@ -83,20 +83,54 @@ def parse_company(soup):
         if name_el and num_el:
             data[name_el.get_text(strip=True)] = to_number(num_el.get_text())
 
+    # Growth boxes (flexible matching on the title and the "5 Years" label)
     for ul in soup.select("ul.ranges-table"):
         items = ul.find_all("li")
         if not items:
             continue
-        title = items[0].get_text(strip=True)
+        title = items[0].get_text(" ", strip=True).lower()
+        if "sales" in title or "revenue" in title:
+            kind = "Sales"
+        elif "profit" in title:
+            kind = "Profit"
+        else:
+            continue
         for li in items[1:]:
             text = li.get_text(" ", strip=True)
-            if ":" in text:
-                period, value = text.split(":", 1)
-                data[f"{title} {period.strip()}"] = to_number(value)
+            m = re.match(r"\s*(\d+)\s*Years?", text, re.I)
+            if m and ":" in text:
+                data[f"{kind} Growth {m.group(1)}Y"] = to_number(text.split(":", 1)[1])
 
-    data["Sales Growth 5Y"] = data.get("Compounded Sales Growth 5 Years")
-    data["Profit Growth 5Y"] = data.get("Compounded Profit Growth 5 Years")
+    # Fallback: compute 5-year growth from the annual profit & loss table
+    if data.get("Sales Growth 5Y") is None:
+        data["Sales Growth 5Y"] = cagr_from_table(soup, ("sales", "revenue"))
+    if data.get("Profit Growth 5Y") is None:
+        data["Profit Growth 5Y"] = cagr_from_table(soup, ("net profit",))
     return data
+
+
+def cagr_from_table(soup, row_prefixes, years=5):
+    """5-year growth (CAGR %) from the annual columns of the profit & loss table."""
+    section = soup.select_one("section#profit-loss")
+    table = section.select_one("table.data-table") if section else None
+    if table is None:
+        return None
+    headers = [th.get_text(strip=True) for th in table.select("thead th")][1:]
+    annual = [i for i, h in enumerate(headers) if h and h.upper() != "TTM"]
+    for tr in table.select("tbody tr"):
+        cells = tr.find_all("td")
+        if not cells:
+            continue
+        label = cells[0].get_text(strip=True).lower()
+        if any(label.startswith(p) for p in row_prefixes):
+            values = [to_number(c.get_text()) for c in cells[1:]]
+            values = [values[i] for i in annual if i < len(values)]
+            if len(values) > years:
+                end, start = values[-1], values[-1 - years]
+                if end and start and end > 0 and start > 0:
+                    return round(((end / start) ** (1 / years) - 1) * 100, 1)
+            return None
+    return None
 
 
 def add_valuation(d):
@@ -167,6 +201,8 @@ def main():
                 print(" skipped (page not found or blocked)")
                 continue
             d = parse_company(soup)
+            if i == 1:
+                print(" check:", {k: v for k, v in d.items() if "Growth" in k})
             add_valuation(d)
             is_fin = "financial" in str(s["Industry"]).lower()
             d["Score %"], d["Passed"], d["Failed"] = score(d, is_fin)
