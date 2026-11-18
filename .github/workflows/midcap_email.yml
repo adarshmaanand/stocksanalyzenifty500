@@ -1,0 +1,12 @@
+{
+"name": "Midcap Stock Report",
+"on": {"schedule": [{"cron": "30 8 * * 0"}], "workflow_dispatch": {}},
+"jobs": {"report": {"runs-on": "ubuntu-latest", "timeout-minutes": 60, "steps": [
+{"name": "Checkout repo", "uses": "actions/checkout@v4"},
+{"name": "Set up Python", "uses": "actions/setup-python@v5", "with": {"python-version": "3.11"}},
+{"name": "Install dependencies", "run": "pip install -r requirements.txt"},
+{"name": "Clean pasted characters", "run": "sed -i 's/\\xC2\\xA0/ /g' stock_screener.py stock_screener_midcap.py"},
+{"name": "Run midcap script", "run": "python stock_screener_midcap.py", "env": {"MAX_STOCKS": "25"}},
+{"name": "Email the Excel file", "uses": "dawidd6/action-send-mail@v3", "with": {"server_address": "smtp.gmail.com", "server_port": 465, "secure": true, "username": "${{ secrets.EMAIL_USER }}", "password": "${{ secrets.EMAIL_APP_PASSWORD }}", "subject": "Nifty Midcap 150 Value + Growth Picks", "to": "${{ secrets.EMAIL_TO }}", "from": "Stock Bot <${{ secrets.EMAIL_USER }}>", "body": "file://top_picks_midcap.txt", "attachments": "midcap_ranking.xlsx"}}
+]}}
+}
