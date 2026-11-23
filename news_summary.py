@@ -2,7 +2,8 @@
 Moneycontrol news digest: last 24 hours of headlines, rated Positive / Negative /
 Neutral by Claude, with an overall market opinion. Writes an email-ready summary.
 
-Needs the ANTHROPIC_API_KEY environment variable (a GitHub secret in the workflow).
+Needs the GEMINI_API_KEY environment variable (a GitHub secret in the workflow).
+(ANTHROPIC_API_KEY also works as an optional backup.)
 Only the 'requests' package is required.
 
 Outputs:
@@ -25,9 +26,11 @@ import requests
 # ---------------- CONFIG ----------------
 IST = timezone(timedelta(hours=5, minutes=30))
 HOURS = int(os.environ.get("NEWS_HOURS", "24")) # only news from the last N hours
-MAX_ITEMS = int(os.environ.get("MAX_ITEMS", "40")) # cap headlines sent for analysis
+MAX_ITEMS = int(os.environ.get("MAX_ITEMS", "50")) # cap headlines sent for analysis
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
-API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+API_KEY = os.environ.get("ANTHROPIC_API_KEY", "") # optional backup (Claude)
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 HEADERS = {"User-Agent": "Mozilla/5.0 (personal news digest)"}
 
 MC_FEEDS = {
@@ -39,6 +42,8 @@ MC_FEEDS = {
 }
 # Used automatically if the Moneycontrol feeds return too little fresh news
 FALLBACK_FEEDS = {
+    "Moneycontrol Markets (Google News)":
+        "https://news.google.com/rss/search?q=site:moneycontrol.com+(stocks+OR+sensex+OR+nifty+OR+shares+OR+RBI+OR+earnings)+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
     "Moneycontrol (Google News)":
         "https://news.google.com/rss/search?q=site:moneycontrol.com+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
     "Moneycontrol (Bing News)":
@@ -131,38 +136,99 @@ def collect_news(now, notes):
     return items[:MAX_ITEMS]
 
 
-def analyse_with_claude(items):
+def build_prompt(items):
     lines = [f"{i} | {it['time']:%d %b %H:%M} | {it['title']} | {it['summary']}"
              for i, it in enumerate(items, start=1)]
     prompt = (
-        "Below are Moneycontrol headlines from the last 24 hours (IST). Rate each one for its "
-        "likely effect on Indian stock markets and give an overall view.\n\n"
+        "Below are Moneycontrol headlines from the last 24 hours (IST). For each one, judge its likely "
+        "effect on Indian stock prices, then give an overall view of the market.\n\n"
         "Return ONLY valid JSON (no markdown) in this shape:\n"
         '{"market_mood": "Bullish|Bearish|Neutral|Mixed",\n'
+        ' "market_outlook": "1-2 sentences: likely bias for Nifty/Sensex today (up, down or flat) and your confidence",\n'
         ' "summary": "2-3 sentences on what happened",\n'
         ' "opinion": "3-5 sentences: your view on likely near-term market direction, with key risks",\n'
         ' "watch": ["up to 5 short strings: sectors, stocks or events to watch"],\n'
-        ' "items": [{"id": 1, "sentiment": "Positive|Negative|Neutral", '
-        '"impact": "High|Medium|Low", "stocks": ["affected stocks or sectors"], '
-        '"reason": "max 20 words"}]}\n\n'
-        "Rules: use only the headlines given; do not invent facts, prices or numbers; say when "
-        "you are unsure; this is analysis, not investment advice.\n\nHeadlines "
-        "(id | time | title | summary):\n" + "\n".join(lines)
+        ' "items": [{"id": 1, "sentiment": "Positive|Negative|Neutral|Not relevant", '
+        '"scope": "Stock|Sector|Market|None", "impact": "High|Medium|Low", '
+        '"stocks": ["affected stocks or sectors"], '
+        '"reason": "max 20 words, and which way prices may move"}]}\n\n'
+        "Rules: scope Market = could move the broad indices (RBI, rates, crude, FII flows, global cues, "
+        "budget, index heavyweights); Sector = a whole industry; Stock = specific companies. Use "
+        "sentiment 'Not relevant' and scope 'None' for headlines with no plausible effect on listed "
+        "Indian stocks (crime, lifestyle, foreign politics and similar). Use only the headlines given; "
+        "do not invent facts, prices or numbers; say when you are unsure; this is analysis, not "
+        "investment advice.\n\nHeadlines (id | time | title | summary):\n" + "\n".join(lines)
     )
+    return prompt
+
+
+def extract_json(text):
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end < 0:
+        raise ValueError("model did not return JSON")
+    return json.loads(text[start:end + 1])
+
+
+SYSTEM_TEXT = "You are a careful, balanced Indian equity market analyst."
+
+
+def call_gemini(prompt, model):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    resp = None
+    for attempt in range(3):
+        resp = requests.post(
+            url,
+            headers={"x-goog-api-key": GEMINI_KEY, "content-type": "application/json"},
+            json={"systemInstruction": {"parts": [{"text": SYSTEM_TEXT}]},
+                  "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                  "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192,
+                                       "responseMimeType": "application/json"}},
+            timeout=180,
+        )
+        if resp.status_code in (429, 503): # busy or rate limited: wait and retry
+            time.sleep(20 * (attempt + 1))
+            continue
+        break
+    if not resp.ok:
+        raise RuntimeError(f"API error {resp.status_code}: {resp.text[:200]}")
+    parts = resp.json()["candidates"][0]["content"]["parts"]
+    return extract_json("".join(p.get("text", "") for p in parts if not p.get("thought")))
+
+
+def call_claude(prompt, model):
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01",
                  "content-type": "application/json"},
-        json={"model": MODEL, "max_tokens": 6000,
-              "system": "You are a careful, balanced Indian equity market analyst.",
+        json={"model": model, "max_tokens": 8000, "system": SYSTEM_TEXT,
               "messages": [{"role": "user", "content": prompt}]},
         timeout=180,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        raise RuntimeError(f"API error {resp.status_code}: {resp.text[:200]}")
     text = "".join(b.get("text", "") for b in resp.json().get("content", [])
                    if b.get("type") == "text")
-    start, end = text.find("{"), text.rfind("}")
-    return json.loads(text[start:end + 1])
+    return extract_json(text)
+
+
+def analyse(items, notes):
+    """Try Gemini first (then a lighter Gemini model), then Claude if its key is set."""
+    prompt = build_prompt(items)
+    attempts = []
+    if GEMINI_KEY:
+        for m in dict.fromkeys([GEMINI_MODEL, "gemini-2.5-flash-lite"]):
+            attempts.append((f"Gemini {m}", lambda m=m: call_gemini(prompt, m)))
+    if API_KEY:
+        attempts.append((f"Claude {MODEL}", lambda: call_claude(prompt, MODEL)))
+    last = ""
+    for name, fn in attempts:
+        try:
+            return fn()
+        except Exception as ex:
+            last = f"{name}: {str(ex)[:200]}"
+            print(f"AI analysis failed with {last}")
+    notes.append(f"AI analysis failed ({last}), so headlines are shown without ratings.")
+    return None
 
 
 COLORS = {"Positive": "#1a7f37", "Negative": "#cf222e", "Neutral": "#6e7781", "Unrated": "#6e7781"}
@@ -179,14 +245,20 @@ def build_outputs(items, analysis, now, session, notes):
                 by_id[str(a["id"])] = a
 
     groups = {"Positive": [], "Negative": [], "Neutral": [], "Unrated": []}
+    skipped = 0
     for i, it in enumerate(items, start=1):
         a = by_id.get(str(i), {})
         sent = str(a.get("sentiment", "")).capitalize()
         if not analysis:
             sent = "Unrated"
+        elif sent.startswith("Not") or str(a.get("scope", "")).lower() == "none":
+            skipped += 1
+            continue
         elif sent not in ("Positive", "Negative", "Neutral"):
             sent = "Neutral"
         groups[sent].append((it, a))
+    if skipped:
+        notes.append(f"{skipped} headlines were skipped as not market-related.")
     for g in groups.values():
         g.sort(key=lambda x: IMPACT_ORDER.get(str(x[1].get("impact")), 3))
 
@@ -207,6 +279,9 @@ def build_outputs(items, analysis, now, session, notes):
                  f"font-weight:bold'>Market mood: {e(str(mood))}</span> "
                  f"<span style='color:#666;font-size:13px'>{e(count_text)}</span></p>")
         h.append(f"<p>{e(str(analysis.get('summary', '')))}</p>")
+        if analysis.get("market_outlook"):
+            h.append("<p style='background:#f6f8fa;border-left:4px solid " + mc + ";padding:8px 10px;color:#222'>"
+                     f"<b>Nifty/Sensex outlook:</b> {e(str(analysis['market_outlook']))}</p>")
         h.append("<h3 style='margin-bottom:4px'>My opinion</h3>"
                  f"<p style='margin-top:0'>{e(str(analysis.get('opinion', '')))}</p>")
         if watch:
@@ -220,6 +295,8 @@ def build_outputs(items, analysis, now, session, notes):
                  f"padding-bottom:3px'>{label} ({len(groups[sent])})</h3>")
         for it, a in groups[sent]:
             meta = f"{it['time']:%d %b %H:%M} &middot; {e(it['source'])}"
+            if a.get("scope"):
+                meta += f" &middot; Affects: {e(str(a['scope']))}"
             if a.get("impact"):
                 meta += f" &middot; Impact: {e(str(a['impact']))}"
             extra = ""
@@ -241,6 +318,7 @@ def build_outputs(items, analysis, now, session, notes):
          f"Last {HOURS} hours, {len(items)} headlines"]
     if analysis:
         t += [f"Market mood: {mood} ({count_text})", "", str(analysis.get("summary", "")), "",
+              "NIFTY/SENSEX OUTLOOK", str(analysis.get("market_outlook", "")), "",
               "MY OPINION", str(analysis.get("opinion", ""))]
         if watch:
             t += ["", "WATCH"] + [f"- {w}" for w in watch]
@@ -271,14 +349,10 @@ def main():
     if not items:
         notes.append(f"No Moneycontrol news found in the last {HOURS} hours "
                      "(feeds may be down or blocked).")
-    elif not API_KEY:
-        notes.append("ANTHROPIC_API_KEY is not set, so headlines are shown without analysis.")
+    elif not (GEMINI_KEY or API_KEY):
+        notes.append("GEMINI_API_KEY is not set, so headlines are shown without analysis.")
     else:
-        try:
-            analysis = analyse_with_claude(items)
-        except Exception as ex:
-            print(f"Claude analysis failed: {ex}")
-            notes.append("AI analysis failed this time, so headlines are shown without ratings.")
+        analysis = analyse(items, notes)
 
     subject, html_body, text_body = build_outputs(items, analysis, now, session, notes)
     with open("news_summary.html", "w", encoding="utf-8") as f:
