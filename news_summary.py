@@ -30,7 +30,7 @@ MAX_ITEMS = int(os.environ.get("MAX_ITEMS", "50")) # cap headlines sent for anal
 MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "") # optional backup (Claude)
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 HEADERS = {"User-Agent": "Mozilla/5.0 (personal news digest)"}
 
 MC_FEEDS = {
@@ -211,23 +211,53 @@ def call_claude(prompt, model):
     return extract_json(text)
 
 
+def discover_gemini_models():
+    """Ask Google which Flash models this key can use (names change over time)."""
+    resp = requests.get("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+                        headers={"x-goog-api-key": GEMINI_KEY}, timeout=30)
+    if not resp.ok:
+        raise RuntimeError(f"model list error {resp.status_code}")
+    names = []
+    for m in resp.json().get("models", []):
+        name = m.get("name", "").replace("models/", "")
+        if ("flash" in name and "generateContent" in m.get("supportedGenerationMethods", [])
+                and not any(x in name for x in ("image", "tts", "live", "audio", "embed", "thinking"))):
+            names.append(name)
+    # newest version first, preferring the full Flash model over Flash-Lite
+    names.sort(key=lambda n: ("lite" in n, [-int(x) for x in re.findall(r"\d+", n)]))
+    print("Discovered Gemini models:", names[:6])
+    return names
+
+
+def call_gemini_discovered(prompt):
+    last = None
+    for m in discover_gemini_models()[:3]:
+        try:
+            return call_gemini(prompt, m)
+        except Exception as ex:
+            last = ex
+    raise RuntimeError(f"no usable Gemini model found ({last})")
+
+
 def analyse(items, notes):
-    """Try Gemini first (then a lighter Gemini model), then Claude if its key is set."""
+    """Try Gemini (named models, then auto-discovered ones), then Claude if its key is set."""
     prompt = build_prompt(items)
     attempts = []
     if GEMINI_KEY:
-        for m in dict.fromkeys([GEMINI_MODEL, "gemini-2.5-flash-lite"]):
+        for m in dict.fromkeys([GEMINI_MODEL, "gemini-3.5-flash-lite"]):
             attempts.append((f"Gemini {m}", lambda m=m: call_gemini(prompt, m)))
+        attempts.append(("Gemini (auto-discovered model)", lambda: call_gemini_discovered(prompt)))
     if API_KEY:
         attempts.append((f"Claude {MODEL}", lambda: call_claude(prompt, MODEL)))
-    last = ""
+    errors = []
     for name, fn in attempts:
         try:
             return fn()
         except Exception as ex:
-            last = f"{name}: {str(ex)[:200]}"
-            print(f"AI analysis failed with {last}")
-    notes.append(f"AI analysis failed ({last}), so headlines are shown without ratings.")
+            msg = re.sub(r"\s+", " ", str(ex))[:160]
+            errors.append(f"{name}: {msg}")
+            print(f"AI analysis failed with {errors[-1]}")
+    notes.append("AI analysis failed (" + " | ".join(errors)[:450] + "), so headlines are shown without ratings.")
     return None
 
 
