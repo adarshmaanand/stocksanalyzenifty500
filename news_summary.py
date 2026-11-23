@@ -12,6 +12,7 @@ Outputs:
   subject.txt (email subject line)
 """
 
+import csv
 import email.utils
 import html
 import json
@@ -19,7 +20,8 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from urllib.parse import quote
 
 import requests
 
@@ -32,6 +34,8 @@ API_KEY = os.environ.get("ANTHROPIC_API_KEY", "") # optional backup (Claude)
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 HEADERS = {"User-Agent": "Mozilla/5.0 (personal news digest)"}
+PRED_FILE = "predictions.csv" # prediction history, saved back to the repo by the workflow
+BAND = 0.25 # Nifty move (%) smaller than this counts as "Flat"
 
 MC_FEEDS = {
     "Top News": "https://www.moneycontrol.com/rss/MCtopnews.xml",
@@ -136,7 +140,7 @@ def collect_news(now, notes):
     return items[:MAX_ITEMS]
 
 
-def build_prompt(items):
+def build_prompt(items, snapshot=None, horizon="today's close"):
     lines = [f"{i} | {it['time']:%d %b %H:%M} | {it['title']} | {it['summary']}"
              for i, it in enumerate(items, start=1)]
     prompt = (
@@ -145,6 +149,7 @@ def build_prompt(items):
         "Return ONLY valid JSON (no markdown) in this shape:\n"
         '{"market_mood": "Bullish|Bearish|Neutral|Mixed",\n'
         ' "market_outlook": "1-2 sentences: likely bias for Nifty/Sensex today (up, down or flat) and your confidence",\n'
+        ' "nifty_bias": "Up|Down|Flat", "confidence": 0-100,\n'
         ' "summary": "2-3 sentences on what happened",\n'
         ' "opinion": "3-5 sentences: your view on likely near-term market direction, with key risks",\n'
         ' "watch": ["up to 5 short strings: sectors, stocks or events to watch"],\n'
@@ -159,6 +164,12 @@ def build_prompt(items):
         "do not invent facts, prices or numbers; say when you are unsure; this is analysis, not "
         "investment advice.\n\nHeadlines (id | time | title | summary):\n" + "\n".join(lines)
     )
+    if snapshot:
+        prompt = ("Market data snapshot (latest vs previous close). Use these real figures and never "
+                  "invent numbers:\n" + snapshot_to_text(snapshot) + "\n\n" + prompt)
+    prompt = (f"Prediction task: nifty_bias is your call for where the Nifty 50 will be at {horizon} "
+              "versus its latest level (Up = rise of more than 0.25%, Down = fall of more than 0.25%, "
+              "otherwise Flat). confidence is 0-100.\n\n" + prompt)
     return prompt
 
 
@@ -239,9 +250,9 @@ def call_gemini_discovered(prompt):
     raise RuntimeError(f"no usable Gemini model found ({last})")
 
 
-def analyse(items, notes):
+def analyse(items, notes, snapshot=None, horizon="today's close"):
     """Try Gemini (named models, then auto-discovered ones), then Claude if its key is set."""
-    prompt = build_prompt(items)
+    prompt = build_prompt(items, snapshot, horizon)
     attempts = []
     if GEMINI_KEY:
         for m in dict.fromkeys([GEMINI_MODEL, "gemini-3.5-flash-lite"]):
@@ -267,7 +278,8 @@ IMPACT_ORDER = {"High": 0, "Medium": 1, "Low": 2}
 e = html.escape
 
 
-def build_outputs(items, analysis, now, session, notes):
+def build_outputs(items, analysis, now, session, notes, snapshot_html="", snapshot_text="",
+                  track_html="", track_text=""):
     by_id = {}
     if analysis:
         for a in analysis.get("items", []):
@@ -303,6 +315,8 @@ def build_outputs(items, analysis, now, session, notes):
          f"<h2 style='margin-bottom:2px'>Market News {e(session)}</h2>",
          f"<div style='color:#666;font-size:13px'>{e(date_text)} &middot; last {HOURS} hours "
          f"&middot; {len(items)} headlines</div>"]
+    if snapshot_html:
+        h.append(snapshot_html)
     if analysis:
         mc = MOOD_COLORS.get(mood, "#6e7781")
         h.append(f"<p><span style='background:{mc};color:#fff;padding:4px 10px;border-radius:12px;"
@@ -338,6 +352,8 @@ def build_outputs(items, analysis, now, session, notes):
                      f"text-decoration:none;font-weight:bold'>{e(it['title'])}</a><br>"
                      f"<span style='color:#666;font-size:12px'>{meta}</span>"
                      f"<span style='font-size:13px'>{extra}</span></p>")
+    if track_html:
+        h.append(track_html)
     for n in notes:
         h.append(f"<p style='color:#9a6700;font-size:13px'>Note: {e(n)}</p>")
     h.append("<p style='color:#888;font-size:12px'>Automated AI analysis of headlines only. "
@@ -346,6 +362,8 @@ def build_outputs(items, analysis, now, session, notes):
     # ---------- Plain text ----------
     t = [f"MARKET NEWS {session.upper()} - {date_text}",
          f"Last {HOURS} hours, {len(items)} headlines"]
+    if snapshot_text:
+        t += ["", snapshot_text, ""]
     if analysis:
         t += [f"Market mood: {mood} ({count_text})", "", str(analysis.get("summary", "")), "",
               "NIFTY/SENSEX OUTLOOK", str(analysis.get("market_outlook", "")), "",
@@ -362,6 +380,8 @@ def build_outputs(items, analysis, now, session, notes):
             if a.get("reason"):
                 t.append(f" {a['reason']}")
             t.append(f" {it['link']}")
+    if track_text:
+        t += ["", track_text]
     t += [""] + [f"Note: {n}" for n in notes]
     t.append("Automated AI analysis of headlines only. Not investment advice.")
 
@@ -369,12 +389,176 @@ def build_outputs(items, analysis, now, session, notes):
     return subject, "\n".join(h), "\n".join(t)
 
 
+# ---------------- Live market data ----------------
+SNAPSHOT_SYMBOLS = [
+    ("Nifty 50", "^NSEI"), ("Sensex", "^BSESN"), ("Bank Nifty", "^NSEBANK"), ("Nifty IT", "^CNXIT"),
+    ("India VIX", "^INDIAVIX"), ("USD/INR", "INR=X"), ("Brent crude", "BZ=F"), ("Gold", "GC=F"),
+    ("S&P 500", "^GSPC"), ("Nasdaq", "^IXIC"), ("Nikkei 225", "^N225"), ("Hang Seng", "^HSI"),
+]
+
+
+def yahoo_daily(symbol, range_="5d"):
+    """Daily closes as [(date, close), ...] from Yahoo Finance's public chart endpoint."""
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{quote(symbol)}?range={range_}&interval=1d"
+    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    result = resp.json()["chart"]["result"][0]
+    closes = result["indicators"]["quote"][0]["close"]
+    return [(datetime.fromtimestamp(t, IST).date(), c) for t, c in zip(result["timestamp"], closes)
+            if c is not None]
+
+
+def fetch_market_snapshot():
+    snap = []
+    for name, symbol in SNAPSHOT_SYMBOLS:
+        try:
+            series = yahoo_daily(symbol)
+            if len(series) >= 2:
+                last, prev = series[-1][1], series[-2][1]
+                snap.append({"name": name, "last": last, "chg": (last / prev - 1) * 100})
+        except Exception as ex:
+            print(f"Market data failed for {name}: {str(ex)[:80]}")
+        time.sleep(0.4)
+    print(f"Market snapshot: {len(snap)} of {len(SNAPSHOT_SYMBOLS)} symbols")
+    return snap
+
+
+def snapshot_to_text(snap):
+    return "\n".join(f"{r['name']}: {r['last']:,.2f} ({r['chg']:+.2f}%)" for r in snap)
+
+
+def snapshot_html(snap):
+    if not snap:
+        return ""
+    cells = []
+    for r in snap:
+        color = "#1a7f37" if r["chg"] >= 0 else "#cf222e"
+        cells.append(f"<td style='padding:4px 8px;border:1px solid #ddd;font-size:12px'>{e(r['name'])}"
+                     f"<br><b>{r['last']:,.1f}</b> <span style='color:{color}'>{r['chg']:+.2f}%</span></td>")
+    rows = "".join("<tr>" + "".join(cells[i:i + 3]) + "</tr>" for i in range(0, len(cells), 3))
+    return ("<div style='font-size:13px;color:#666;margin-top:10px'>Market snapshot "
+            "(latest vs previous close)</div>"
+            f"<table style='border-collapse:collapse;margin:4px 0'>{rows}</table>")
+
+
+def snapshot_text(snap):
+    return ("MARKET SNAPSHOT (latest vs previous close)\n" + snapshot_to_text(snap)) if snap else ""
+
+
+# ---------------- Prediction tracking ----------------
+PRED_FIELDS = ["run_date", "session", "mood", "nifty_bias", "confidence", "outlook",
+               "outcome_date", "baseline", "outcome_close", "change_pct", "result"]
+
+
+def load_history():
+    if not os.path.exists(PRED_FILE):
+        return []
+    with open(PRED_FILE, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def save_history(rows):
+    with open(PRED_FILE, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=PRED_FIELDS)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in PRED_FIELDS})
+
+
+def classify(change):
+    return "Up" if change > BAND else "Down" if change < -BAND else "Flat"
+
+
+def evaluate_pending(rows, now):
+    """Compare earlier predictions with what the Nifty actually did once the closing bar is final."""
+    pending = [r for r in rows if r.get("result") in ("", "Pending", None)]
+    if not pending:
+        return
+    try:
+        closes = dict(yahoo_daily("^NSEI", "3mo"))
+    except Exception as ex:
+        print(f"Could not load Nifty history for tracking: {str(ex)[:80]}")
+        return
+    dates = sorted(closes)
+    today, market_closed = now.date(), now.hour >= 16
+    for r in pending:
+        run_date = date.fromisoformat(r["run_date"])
+        if r["session"] == "Morning Brief": # call is for the same day's close vs previous close
+            prior = [d for d in dates if d < run_date]
+            out_date = run_date
+            if out_date not in closes or not prior:
+                base = None
+            else:
+                base = closes[prior[-1]]
+        else: # call is for the next trading day's close
+            later = [d for d in dates if d > run_date]
+            if run_date not in closes or not later:
+                base = None
+            else:
+                out_date, base = later[0], closes[run_date]
+        if base is None:
+            if (today - run_date).days > 7:
+                r["result"] = "No data"
+            continue
+        if out_date > today or (out_date == today and not market_closed):
+            continue # closing bar not final yet
+        change = (closes[out_date] / base - 1) * 100
+        r.update({"outcome_date": out_date.isoformat(), "baseline": round(base, 1),
+                  "outcome_close": round(closes[out_date], 1), "change_pct": round(change, 2),
+                  "result": "Hit" if classify(change) == r.get("nifty_bias") else "Miss"})
+
+
+def log_prediction(rows, analysis, now, session):
+    if now.weekday() >= 5: # markets are closed, nothing to score
+        return
+    bias = str(analysis.get("nifty_bias", "")).strip().capitalize()
+    if bias not in ("Up", "Down", "Flat"):
+        return
+    run_date = now.date().isoformat()
+    rows[:] = [r for r in rows if not (r.get("run_date") == run_date and r.get("session") == session
+                                       and r.get("result") in ("", "Pending"))]
+    rows.append({"run_date": run_date, "session": session, "mood": analysis.get("market_mood", ""),
+                 "nifty_bias": bias, "confidence": analysis.get("confidence", ""),
+                 "outlook": str(analysis.get("market_outlook", ""))[:200], "result": "Pending"})
+
+
+def accuracy_summary(rows):
+    done = [r for r in rows if r.get("result") in ("Hit", "Miss")]
+    waiting = [r for r in rows if r.get("result") in ("", "Pending", None)]
+    if not done:
+        text = (f"PREDICTION TRACKER: started, {len(waiting)} prediction(s) waiting for market closes. "
+                "Results will appear here after the next trading day.")
+        return f"<p style='color:#666;font-size:13px'>{e(text)}</p>", text
+    hits = sum(r["result"] == "Hit" for r in done)
+    directional = [r for r in done if r.get("nifty_bias") in ("Up", "Down")]
+    d_hits = sum(r["result"] == "Hit" for r in directional)
+    last = done[-10:]
+    l_hits = sum(r["result"] == "Hit" for r in last)
+    head = f"PREDICTION TRACKER: {hits}/{len(done)} correct ({100 * hits // len(done)}%)"
+    if directional:
+        head += f"; Up/Down calls {d_hits}/{len(directional)} ({100 * d_hits // len(directional)}%)"
+    head += f"; last {len(last)}: {l_hits}/{len(last)}."
+    lines = [f"{r['outcome_date']} {str(r['session']).split()[0]}: said {r['nifty_bias']}, "
+             f"Nifty {float(r['change_pct']):+.2f}% -> {r['result']}" for r in done[-5:][::-1]]
+    note = "Small samples mean little; pure chance would be right roughly 35-50% of the time."
+    text = head + "\n" + "\n".join(f" {ln}" for ln in lines) + "\n" + note
+    html_out = (f"<h3 style='margin-bottom:4px'>Prediction tracker</h3><p style='margin:2px 0'>"
+                f"<b>{e(head.split(': ', 1)[1])}</b></p><ul style='margin:2px 0;font-size:13px'>"
+                + "".join(f"<li>{e(ln)}</li>" for ln in lines)
+                + f"</ul><p style='color:#666;font-size:12px'>{e(note)}</p>")
+    return html_out, text
+
+
 def main():
     now = datetime.now(IST)
     session = "Morning Brief" if now.hour < 12 else "Afternoon Update"
+    horizon = "today's close" if now.hour < 12 else "the next trading day's close"
     notes = []
 
     items = collect_news(now, notes)
+    snapshot = fetch_market_snapshot()
+    if not snapshot:
+        notes.append("Live market data was unavailable this time (Yahoo Finance may be blocking).")
     analysis = None
     if not items:
         notes.append(f"No Moneycontrol news found in the last {HOURS} hours "
@@ -382,9 +566,21 @@ def main():
     elif not (GEMINI_KEY or API_KEY):
         notes.append("GEMINI_API_KEY is not set, so headlines are shown without analysis.")
     else:
-        analysis = analyse(items, notes)
+        analysis = analyse(items, notes, snapshot, horizon)
 
-    subject, html_body, text_body = build_outputs(items, analysis, now, session, notes)
+    history = load_history()
+    try:
+        evaluate_pending(history, now)
+        if analysis:
+            log_prediction(history, analysis, now, session)
+        save_history(history)
+    except Exception as ex:
+        print(f"Tracking error: {ex}")
+    track_html, track_text = accuracy_summary(history)
+
+    subject, html_body, text_body = build_outputs(
+        items, analysis, now, session, notes,
+        snapshot_html(snapshot), snapshot_text(snapshot), track_html, track_text)
     with open("news_summary.html", "w", encoding="utf-8") as f:
         f.write(html_body)
     with open("news_summary.txt", "w", encoding="utf-8") as f:
