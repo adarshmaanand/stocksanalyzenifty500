@@ -16,6 +16,7 @@ import html
 import json
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
@@ -40,6 +41,8 @@ MC_FEEDS = {
 FALLBACK_FEEDS = {
     "Moneycontrol (Google News)":
         "https://news.google.com/rss/search?q=site:moneycontrol.com+when:1d&hl=en-IN&gl=IN&ceid=IN:en",
+    "Moneycontrol (Bing News)":
+        "https://www.bing.com/news/search?q=site%3Amoneycontrol.com&format=RSS&qft=interval%3D%227%22",
 }
 MIN_ITEMS_BEFORE_FALLBACK = 8
 # ----------------------------------------
@@ -64,7 +67,13 @@ def parse_date(text):
 
 
 def fetch_feed(label, url):
-    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp = None
+    for attempt in range(3):
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        if resp.status_code == 429: # rate limited: wait and retry
+            time.sleep(20 * (attempt + 1))
+            continue
+        break
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
     out = []
@@ -90,6 +99,18 @@ def collect_news(now, notes):
             except Exception as e:
                 print(f"Feed failed ({label}): {e}")
                 continue
+            if not found:
+                print(f"{label}: feed returned no items")
+                continue
+            # Some feeds label IST times as UTC, which puts the newest items hours in the future
+            ahead = max(it["time"] for it in found) - now
+            if timedelta(hours=3) <= ahead <= timedelta(hours=8):
+                for it in found:
+                    it["time"] -= timedelta(hours=5, minutes=30)
+                print(f"{label}: dates looked shifted by 5.5h, corrected")
+            newest = max(it["time"] for it in found)
+            oldest = min(it["time"] for it in found)
+            print(f"{label}: newest item {newest:%d %b %H:%M}, oldest {oldest:%d %b %H:%M} (now {now:%d %b %H:%M})")
             fresh = 0
             for it in found:
                 key = re.sub(r"\W+", "", it["title"].lower())
