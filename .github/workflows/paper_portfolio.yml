@@ -8,6 +8,6 @@
 {"name": "Clean pasted characters", "run": "sed -i 's/\\xC2\\xA0/ /g' paper_portfolio.py"},
 {"name": "Run news script", "run": "python paper_portfolio.py", "env": {"GEMINI_API_KEY": "${{ secrets.GEMINI_API_KEY }}"}},
 {"name": "Set subject", "run": "echo \"SUBJECT=$(cat subject.txt)\" >> $GITHUB_ENV"},
-{"name": "Email the summary", "uses": "dawidd6/action-send-mail@v3", "with": {"server_address": "smtp.gmail.com", "server_port": 465, "secure": true, "username": "${{ secrets.EMAIL_USER }}", "password": "${{ secrets.EMAIL_APP_PASSWORD }}", "subject": "${{ env.SUBJECT }}", "to": "${{ secrets.EMAIL_TO }}", "from": "Paper Portfolio News <${{ secrets.EMAIL_USER }}>", "body": "file://news_summary.txt", "html_body": "file://news_summary.html"}}
+{"name": "Email the summary", "uses": "dawidd6/action-send-mail@v3", "with": {"server_address": "smtp.gmail.com", "server_port": 465, "secure": true, "username": "${{ secrets.EMAIL_USER }}", "password": "${{ secrets.EMAIL_APP_PASSWORD }}", "subject": "Portfolio", "to": "${{ secrets.EMAIL_TO }}", "from": "Paper Portfolio News <${{ secrets.EMAIL_USER }}>", "body": "file://news_summary.txt", "html_body": "file://news_summary.html"}}
 ]}}
 }
