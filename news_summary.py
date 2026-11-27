@@ -1,19 +1,6 @@
-"""
-Moneycontrol news digest: last 24 hours of headlines, rated Positive / Negative /
-Neutral by Claude, with an overall market opinion. Writes an email-ready summary.
-
-Needs the GEMINI_API_KEY environment variable (a GitHub secret in the workflow).
-(ANTHROPIC_API_KEY also works as an optional backup.)
-Only the 'requests' package is required.
-
-Outputs:
-  news_summary.html (email body, formatted)
-  news_summary.txt (plain-text email body)
-  subject.txt (email subject line)
-"""
-
 import csv
 import email.utils
+import glob
 import html
 import json
 import os
@@ -279,7 +266,7 @@ e = html.escape
 
 
 def build_outputs(items, analysis, now, session, notes, snapshot_html="", snapshot_text="",
-                  track_html="", track_text=""):
+                  track_html="", track_text="", picks_html="", picks_text=""):
     by_id = {}
     if analysis:
         for a in analysis.get("items", []):
@@ -331,6 +318,8 @@ def build_outputs(items, analysis, now, session, notes, snapshot_html="", snapsh
         if watch:
             h.append("<h3 style='margin-bottom:4px'>Watch</h3><ul style='margin-top:0'>"
                      + "".join(f"<li>{e(str(w))}</li>" for w in watch) + "</ul>")
+    if picks_html:
+        h.append(picks_html)
     for sent in ("Positive", "Negative", "Neutral", "Unrated"):
         if not groups[sent]:
             continue
@@ -370,6 +359,8 @@ def build_outputs(items, analysis, now, session, notes, snapshot_html="", snapsh
               "MY OPINION", str(analysis.get("opinion", ""))]
         if watch:
             t += ["", "WATCH"] + [f"- {w}" for w in watch]
+    if picks_text:
+        t += ["", picks_text]
     for sent in ("Positive", "Negative", "Neutral", "Unrated"):
         if not groups[sent]:
             continue
@@ -549,6 +540,90 @@ def accuracy_summary(rows):
     return html_out, text
 
 
+# ---------------- News on your picks ----------------
+SYMBOL_STOPWORDS = {"THE", "AND", "FOR", "ALL", "NEW", "IPO", "FII", "DII", "RBI", "SEBI", "GDP", "ETF",
+                    "SIP", "NSE", "BSE", "USD", "INR", "CEO", "CFO", "NPA", "EPS", "FY", "Q1", "Q2", "Q3", "Q4"}
+
+
+def clean_name(name):
+    n = re.sub(r"\(.*?\)", " ", str(name).lower())
+    n = re.sub(r"[^a-z0-9& ]+", " ", n)
+    n = re.sub(r"\b(limited|ltd|corporation|corp|company|co|inc|the)\b", " ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+def load_watchlist():
+    """Shortlisted stocks from the screeners (watchlist_*.csv) plus symbols in my_stocks.txt."""
+    rows = []
+    for path in glob.glob("watchlist_*.csv"):
+        try:
+            with open(path, newline="", encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    if r.get("Shortlisted") == "Yes":
+                        r["List"] = "Shortlist"
+                        rows.append(r)
+        except Exception as ex:
+            print(f"Could not read {path}: {ex}")
+    if os.path.exists("my_stocks.txt"):
+        with open("my_stocks.txt", encoding="utf-8") as f:
+            for line in f:
+                sym = line.split("#")[0].strip().upper()
+                if sym:
+                    rows.append({"Symbol": sym, "Company": sym, "List": "My stocks"})
+    return rows
+
+
+def link_news(items, watch):
+    """{headline number: [watchlist rows mentioned in that headline]}"""
+    compiled = []
+    for w in watch:
+        name, sym = clean_name(w.get("Company", "")), str(w.get("Symbol", "")).strip()
+        pats = []
+        if len(name) >= 3 and (" " in name or len(name) >= 6):
+            pats.append((re.compile(r"(?<![a-z0-9])" + re.escape(name) + r"(?![a-z0-9])"), True))
+        if len(sym) >= 3 and sym not in SYMBOL_STOPWORDS:
+            pats.append((re.compile(r"(?<![A-Za-z0-9])" + re.escape(sym) + r"(?![A-Za-z0-9])"), False))
+        if pats:
+            compiled.append((w, pats))
+    links = {}
+    for i, it in enumerate(items, start=1):
+        title = it["title"]
+        low = re.sub(r"[^a-z0-9& ]+", " ", title.lower())
+        for w, pats in compiled:
+            if any(p.search(low if lower else title) for p, lower in pats):
+                links.setdefault(i, []).append(w)
+    return links
+
+
+def picks_section(items, analysis, links):
+    """(html, text) block listing headlines that mention your shortlisted or own stocks."""
+    if not links:
+        return "", ""
+    by_id = {str(a.get("id")): a for a in (analysis or {}).get("items", []) if isinstance(a, dict)}
+    h = ["<h3 style='color:#8250df;border-bottom:2px solid #8250df;padding-bottom:3px'>"
+         f"Your picks in the news ({len(links)})</h3>"]
+    t = [f"== YOUR PICKS IN THE NEWS ({len(links)}) =="]
+    for i, ws in sorted(links.items()):
+        it, a = items[i - 1], by_id.get(str(i), {})
+        sent = str(a.get("sentiment", "")).capitalize() if analysis else ""
+        tags = []
+        for w in ws:
+            tag = w.get("Company") or w.get("Symbol")
+            if w.get("List") == "Shortlist":
+                tag += f" (score {w.get('Score %')}%, {w.get('Valuation')}"
+                tag += f", {w.get('Red Flags')} red flags)" if str(w.get("Red Flags", "0")) != "0" else ")"
+            else:
+                tag += " (my stock)"
+            tags.append(tag)
+        color = COLORS.get(sent, "#6e7781")
+        h.append(f"<p style='margin:8px 0'><b>{e('; '.join(tags))}</b><br>"
+                 f"<a href='{e(it['link'])}' style='color:#0969da;text-decoration:none'>{e(it['title'])}</a><br>"
+                 f"<span style='font-size:13px;color:{color}'>{e(sent)}"
+                 f"{' - ' + e(str(a.get('reason'))) if a.get('reason') else ''}</span></p>")
+        t.append(f"* {'; '.join(tags)}\n {it['title']}\n {sent}{' - ' + str(a.get('reason')) if a.get('reason') else ''}\n {it['link']}")
+    return "".join(h), "\n".join(t)
+
+
 def main():
     now = datetime.now(IST)
     session = "Morning Brief" if now.hour < 12 else "Afternoon Update"
@@ -577,10 +652,12 @@ def main():
     except Exception as ex:
         print(f"Tracking error: {ex}")
     track_html, track_text = accuracy_summary(history)
+    picks_html, picks_text = picks_section(items, analysis, link_news(items, load_watchlist()))
 
     subject, html_body, text_body = build_outputs(
         items, analysis, now, session, notes,
-        snapshot_html(snapshot), snapshot_text(snapshot), track_html, track_text)
+        snapshot_html(snapshot), snapshot_text(snapshot), track_html, track_text,
+        picks_html, picks_text)
     with open("news_summary.html", "w", encoding="utf-8") as f:
         f.write(html_body)
     with open("news_summary.txt", "w", encoding="utf-8") as f:
