@@ -18,6 +18,8 @@ DELAY_SECONDS = 1.5
 MAX_STOCKS = int(os.environ.get("MAX_STOCKS", "0") or 0) # 0 = all 500
 SHORTLIST_MIN_SCORE = 80 # percent of rules a stock must pass
 TOP_N_IN_EMAIL = 15
+SHORTLIST_MAX_FLAGS = 1 # stocks with more red flags go to the "Flagged" sheet
+WATCHLIST_FILE = "watchlist_nifty500.csv" # read by the news digest and the paper portfolio
 HEADERS = {"User-Agent": "Mozilla/5.0 (personal research script)"}
 # ----------------------------------------
 
@@ -185,6 +187,113 @@ def score(d, is_financial):
     return round(100 * len(passed) / len(rules)), "; ".join(passed), "; ".join(failed)
 
 
+# ---------------- Red flags ----------------
+def table_rows(soup, section_id):
+    """Rows of the first data table in a Screener section: ({label: [numbers]}, [headers])."""
+    section = soup.select_one(f"section#{section_id}")
+    table = section.select_one("table.data-table") if section else None
+    if table is None:
+        return {}, []
+    headers = [th.get_text(strip=True) for th in table.select("thead th")][1:]
+    rows = {}
+    for tr in table.select("tbody tr"):
+        cells = tr.find_all("td")
+        if cells:
+            label = re.sub(r"[\s\xa0]*\+?\s*$", "", cells[0].get_text(strip=True)).lower()
+            rows[label] = [to_number(c.get_text()) for c in cells[1:]]
+    return rows, headers
+
+
+def series(rows, headers, prefix):
+    """Numbers of the first row whose label starts with prefix (TTM column and blanks removed)."""
+    for label, vals in rows.items():
+        if label.startswith(prefix):
+            keep = [i for i, h in enumerate(headers) if h.upper() != "TTM" and i < len(vals)]
+            return [vals[i] for i in keep if vals[i] is not None]
+    return []
+
+
+def add_red_flags(soup, d, is_financial):
+    """Adds debt, interest cover, cash conversion, promoter and pledge checks to the row dict."""
+    flags = []
+    pl, pl_h = table_rows(soup, "profit-loss")
+    bs, bs_h = table_rows(soup, "balance-sheet")
+    cf, cf_h = table_rows(soup, "cash-flow")
+    sh, sh_h = table_rows(soup, "shareholding")
+
+    de = cover = None
+    if not is_financial: # banks and NBFCs live on debt, so these checks do not apply
+        borrow = series(bs, bs_h, "borrowings")
+        eq, res = series(bs, bs_h, "equity capital"), series(bs, bs_h, "reserves")
+        if borrow and eq and res and (eq[-1] + res[-1]) > 0:
+            de = borrow[-1] / (eq[-1] + res[-1])
+            if de > 1.5:
+                flags.append(f"High debt (D/E {de:.1f})")
+        op, interest = series(pl, pl_h, "operating profit"), series(pl, pl_h, "interest")
+        if op and interest and interest[-1] and interest[-1] > 0:
+            cover = op[-1] / interest[-1]
+            if cover < 3:
+                flags.append(f"Low interest cover ({cover:.1f}x)")
+        cfo, profit3 = series(cf, cf_h, "cash from operating"), series(pl, pl_h, "net profit")
+        if len(cfo) >= 3 and len(profit3) >= 3 and sum(profit3[-3:]) > 0 \
+                and sum(cfo[-3:]) < 0.5 * sum(profit3[-3:]):
+            flags.append("Weak cash conversion (3Y operating cash flow under half of profit)")
+
+    profit = series(pl, pl_h, "net profit")
+    if len(profit) >= 2 and profit[-2] > 0 and profit[-1] < 0.8 * profit[-2]:
+        flags.append("Net profit fell more than 20% last year")
+
+    promoter = series(sh, sh_h, "promoters")
+    change = None
+    if promoter:
+        d["Promoter Holding"] = promoter[-1]
+    if len(promoter) >= 5:
+        change = round(promoter[-1] - promoter[-5], 2)
+        if change <= -3:
+            flags.append(f"Promoter holding down {abs(change):.1f} points in a year")
+
+    pledged = None
+    m = re.search(r"Pledged percentage\s*([\d.]+)\s*%", soup.get_text(" ", strip=True))
+    if m:
+        pledged = float(m.group(1))
+        if pledged > 10:
+            flags.append(f"Promoter shares pledged ({pledged:.0f}%)")
+
+    cons = [re.sub(r"\s+", " ", li.get_text(" ", strip=True))
+            for li in soup.select("#analysis .cons li, div.cons li")][:4]
+
+    d["D/E"] = round(de, 2) if de is not None else None
+    d["Interest Cover"] = round(cover, 1) if cover is not None else None
+    d["Promoter Change 1Y"] = change
+    d["Pledged %"] = pledged
+    d["Screener Cons"] = " | ".join(cons)
+    d["Red Flags"] = len(flags)
+    d["Red Flag Details"] = "; ".join(flags)
+
+
+def split_shortlists(df):
+    """(clean shortlist, shortlist stocks set aside for red flags)."""
+    base = df[(df["Score %"] >= SHORTLIST_MIN_SCORE)
+              & (df["Valuation"].isin(["Undervalued", "Fairly valued"]))]
+    too_many = base["Red Flags"].fillna(0) > SHORTLIST_MAX_FLAGS
+    clean = base[~too_many].sort_values(["Score %", "Red Flags", "Margin of Safety %"],
+                                        ascending=[False, True, False])
+    return clean, base[too_many]
+
+
+def write_watchlist(df, path):
+    """Compact list of every analysed stock, used by the news digest and paper portfolio."""
+    clean, flagged = split_shortlists(df)
+    out = df[["Company", "Symbol", "Industry", "Score %", "Valuation", "Current Price",
+              "Fair Value (Graham)", "Margin of Safety %", "Red Flags"]].copy()
+    out["Shortlisted"] = out["Symbol"].isin(set(clean["Symbol"]) | set(flagged["Symbol"])).map(
+        {True: "Yes", False: "No"})
+    out["Clean"] = out["Symbol"].isin(set(clean["Symbol"])).map({True: "Yes", False: "No"})
+    out["Updated"] = time.strftime("%Y-%m-%d")
+    out.to_csv(path, index=False)
+    print(f"Saved {path} ({len(out)} stocks, {len(clean)} clean shortlist)")
+
+
 def main():
     stocks = load_nifty500()
     if MAX_STOCKS:
@@ -206,6 +315,7 @@ def main():
             add_valuation(d)
             is_fin = "financial" in str(s["Industry"]).lower()
             d["Score %"], d["Passed"], d["Failed"] = score(d, is_fin)
+            add_red_flags(soup, d, is_fin)
             d["Company"] = s["Company Name"]
             d["Symbol"] = symbol
             d["Industry"] = s["Industry"]
@@ -221,24 +331,28 @@ def main():
     cols = ["Company", "Symbol", "Industry", "Score %", "Valuation", "Current Price",
             "Fair Value (Graham)", "Margin of Safety %", "Stock P/E", "PEG", "P/B",
             "ROE", "ROCE", "Sales Growth 5Y", "Profit Growth 5Y", "Market Cap",
-            "Dividend Yield", "Passed", "Failed"]
+            "Dividend Yield", "Red Flags", "Red Flag Details", "D/E", "Interest Cover",
+            "Promoter Holding", "Promoter Change 1Y", "Pledged %", "Screener Cons", "Passed", "Failed"]
     cols = [c for c in cols if c in df.columns]
     df = df[cols].sort_values(["Score %", "Margin of Safety %"], ascending=False)
 
-    shortlist = df[(df["Score %"] >= SHORTLIST_MIN_SCORE)
-                   & (df["Valuation"].isin(["Undervalued", "Fairly valued"]))]
+    shortlist, flagged = split_shortlists(df)
+    write_watchlist(df, WATCHLIST_FILE)
 
     with pd.ExcelWriter(OUTPUT_FILE) as writer:
         shortlist.to_excel(writer, sheet_name="Shortlist", index=False)
+        flagged.to_excel(writer, sheet_name="Flagged (red flags)", index=False)
         df.to_excel(writer, sheet_name="All", index=False)
 
-    lines = [f"Nifty 500 scan: {len(df)} stocks analysed, {len(shortlist)} on the shortlist.",
+    lines = [f"Nifty 500 scan: {len(df)} stocks analysed, {len(shortlist)} on the clean shortlist "
+             f"({len(flagged)} more set aside for red flags).",
              "Good growth + quality at a fair or low price:", ""]
     for n, (_, r) in enumerate(shortlist.head(TOP_N_IN_EMAIL).iterrows(), start=1):
         lines.append(
             f"{n}. {r['Company']} ({r['Symbol']}) | Score {r['Score %']}% | {r['Valuation']} | "
             f"Price {r['Current Price']} vs fair value {r['Fair Value (Graham)']} | "
-            f"P/E {r['Stock P/E']} | ROE {r['ROE']}% | Profit growth 5Y {r['Profit Growth 5Y']}%"
+            f"P/E {r['Stock P/E']} | ROE {r['ROE']}% | Profit growth 5Y {r['Profit Growth 5Y']}% | "
+            f"Red flags {r['Red Flags']}" + (f" ({r['Red Flag Details']})" if r["Red Flags"] else "")
         )
     lines += ["", "Full list in the attached Excel. Fair value is a rough Graham-number",
               "estimate, not advice. Do your own research before investing."]
