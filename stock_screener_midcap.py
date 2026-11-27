@@ -54,6 +54,7 @@ def analyse(row):
     ss.add_valuation(d)
     is_fin = "financial" in str(row["Industry"]).lower()
     d["Score %"], d["Passed"], d["Failed"] = ss.score(d, is_fin)
+    ss.add_red_flags(soup, d, is_fin)
     d["Company"] = row["Company Name"]
     d["Symbol"] = symbol
     d["Industry"] = row["Industry"]
@@ -103,28 +104,32 @@ def main():
     cols = ["Company", "Symbol", "Industry", "Score %", "Valuation", "Current Price",
             "Fair Value (Graham)", "Margin of Safety %", "Stock P/E", "PEG", "P/B",
             "ROE", "ROCE", "Sales Growth 5Y", "Profit Growth 5Y", "Market Cap",
-            "Dividend Yield", "Note", "Passed", "Failed"]
+            "Dividend Yield", "Note", "Red Flags", "Red Flag Details", "D/E", "Interest Cover",
+            "Promoter Holding", "Promoter Change 1Y", "Pledged %", "Screener Cons", "Passed", "Failed"]
     cols = [c for c in cols if c in df.columns]
     df = df[cols].sort_values(["Score %", "Margin of Safety %"], ascending=False)
 
-    shortlist = df[(df["Score %"] >= ss.SHORTLIST_MIN_SCORE)
-                   & (df["Valuation"].isin(["Undervalued", "Fairly valued"]))]
+    shortlist, flagged = ss.split_shortlists(df)
+    ss.write_watchlist(df, "watchlist_midcap.csv")
     non_fin = shortlist[~shortlist["Industry"].astype(str).str.contains("financial", case=False)]
 
     with pd.ExcelWriter(OUTPUT_FILE) as writer:
         shortlist.to_excel(writer, sheet_name="Shortlist", index=False)
         non_fin.to_excel(writer, sheet_name="Non-Financial Picks", index=False)
+        flagged.to_excel(writer, sheet_name="Flagged (red flags)", index=False)
         df.to_excel(writer, sheet_name="All", index=False)
 
     lines = [f"Nifty Midcap 150 scan: {len(df)} stocks analysed, "
-             f"{len(shortlist)} on the shortlist ({len(non_fin)} non-financial).",
+             f"{len(shortlist)} on the clean shortlist ({len(non_fin)} non-financial; "
+             f"{len(flagged)} more set aside for red flags).",
              "Good growth + quality at a fair or low price:", ""]
     for n, (_, r) in enumerate(shortlist.head(ss.TOP_N_IN_EMAIL).iterrows(), start=1):
         flag = " (!)" if r.get("Note") else ""
         lines.append(
             f"{n}. {r['Company']} ({r['Symbol']}){flag} | Score {r['Score %']}% | {r['Valuation']} | "
             f"Price {r['Current Price']} vs fair value {r['Fair Value (Graham)']} | "
-            f"P/E {r['Stock P/E']} | ROE {r['ROE']}% | Profit growth 5Y {r['Profit Growth 5Y']}%"
+            f"P/E {r['Stock P/E']} | ROE {r['ROE']}% | Profit growth 5Y {r['Profit Growth 5Y']}% | "
+            f"Red flags {r['Red Flags']}" + (f" ({r['Red Flag Details']})" if r["Red Flags"] else "")
         )
     lines += ["", "(!) = see the Note column in the Excel (cyclical peak, low base or missing data).",
               "Midcaps are more volatile than large caps. Fair value is a rough Graham-number",
